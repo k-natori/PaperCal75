@@ -1,7 +1,9 @@
 #include <Arduino.h>
 
 #include <SPI.h>
-#include "epd7in5b_V2.h"
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+#include "SD_MMC.h"
 
 #include <vector>
 #include <map>
@@ -9,11 +11,12 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
-#include "SD_MMC.h"
+#include <Preferences.h>
 
 #include <LovyanGFX.hpp>
 
 #include "PCEvent.h"
+#include "epd7in5b_V2.h"
 
 
 #define SD_MMC_CMD 38
@@ -23,17 +26,28 @@
 #define LED_BUILTIN 2
 #define PIN_BUTTON 4
 
+#define VOLTAGE_TEST 8
+#define VOLTAGE_READ 9
+#define VOLTAGE_ADC_CHANNEL ADC_CHANNEL_8
+
 #define screenWidth 800
 #define screenHeight 480
-#define columnWidth 114
-#define dayHeight 34
-#define maxNumberOfRows 10
+#define HEADER_HEIGHT 0
+#define FOOTER_HEIGHT 20
+#define COLUMN_WIDTH 114
+#define DAY_HEIGHT 34
 
 #define WHITE 255
 #define BLACK 0
 
 #define LARGE_FONT FreeSansBold18pt7b
 #define SMALL_FONT efontJA_12
+
+#define uS_TO_S_FACTOR 1000000ULL
+
+#define prefName "PaperCal"
+#define holidayCacheKey "Holiday"
+#define bootCountKey "Boot"
 
 String pemFileName = "/root_ca.pem";
 std::vector<String> iCalendarURLs;
@@ -49,26 +63,28 @@ int nextMonthYear = 0;
 int nextMonth = 0;
 String dateString = "";
 
-std::multimap<int, PCEvent> eventsInThisMonth;
-std::multimap<int, PCEvent> holidaysInThisMonth;
-std::vector<PCEvent> eventsInNextMonth;
-std::vector<PCEvent> eventsToDisplay;
+Preferences pref;
+String holidayCacheString;
+int bootCount;
 
 LGFX_Sprite blackSprite;
 LGFX_Sprite redSprite;
 
 void showCalendar();
 void loadICalendar(String urlString, boolean holiday);
+uint32_t readVoltage();
+void logLine(String line);
+void shutdown(int wakeUpSeconds);
 
 void setup()
 {
   // put your setup code here, to run once:
   blackSprite.setColorDepth(1);
-  blackSprite.createSprite(screenWidth, screenHeight);
+  blackSprite.createSprite(EPD_WIDTH, EPD_HEIGHT);
   blackSprite.setTextWrap(false);
 
   redSprite.setColorDepth(1);
-  redSprite.createSprite(screenWidth, screenHeight);
+  redSprite.createSprite(EPD_WIDTH, EPD_HEIGHT);
   redSprite.setTextWrap(false);
 
   // SD Card
@@ -147,12 +163,35 @@ void setup()
     File pemFile = SD_MMC.open(pemFileName.c_str());
     if (pemFile)
     {
-      rootCA = pemFile.readString();
+      PCEvent::setRootCA(pemFile.readString());
       pemFile.close();
       log_printf("pem file loaded:%s\n", pemFileName.c_str());
     }
 
+        // Load Holidays cache for this month
+    pref.begin(prefName, false);
+    holidayCacheString = pref.getString(holidayCacheKey, "");
+    bootCount = pref.getInt(bootCountKey, 0);
+    pref.end();
+
+    // Boot count
+    esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+    switch (wakeupCause)
+    {
+    case ESP_SLEEP_WAKEUP_TIMER:
+    {
+      bootCount++;
+      break;
+    }
+    default:
+    {
+      bootCount = 0;
+    }
+    }
+
     pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(VOLTAGE_TEST, OUTPUT);
+    pinMode(VOLTAGE_READ, ANALOG);
   }
 }
 
@@ -180,41 +219,36 @@ void showCalendar()
     delay(500);
     return;
   }
+  PCEvent::setTimeInfo(timeinfo);
+  PCEvent::setHolidayCacheString(holidayCacheString);
 
-  int year = timeinfo.tm_year + 1900;
-  int month = timeinfo.tm_mon + 1;
-  int day = timeinfo.tm_mday;
-  currentYear = year;
-  currentMonth = month;
-  if (currentMonth == 12)
-  {
-    nextMonthYear = currentYear + 1;
-    nextMonth = 1;
-  }
-  else
-  {
-    nextMonthYear = currentYear;
-    nextMonth = currentMonth + 1;
-  }
+  int year = PCEvent::currentYear;
+  int month = PCEvent::currentMonth;
+  int day = PCEvent::currentDay;
 
   log_printf("%d/%d/%d\n", year, month, day);
 
   // Load iCalendar
   for (auto &urlString : iCalendarURLs)
   {
-    loadICalendar(urlString, false);
+    PCEvent::loadICalendar(urlString, false);
   }
-  // loadICalendar(iCalendarURL);
-  if (!iCalendarHolidayURL.isEmpty())
+  // Load iCalendar for holidays
+  if (!PCEvent::isCacheValid() && !iCalendarHolidayURL.isEmpty())
   {
-    loadICalendar(iCalendarHolidayURL, true);
+    PCEvent::loadICalendar(iCalendarHolidayURL, true);
+    pref.begin(prefName, false);
+    pref.putString(holidayCacheKey, PCEvent::holidayCacheString());
+    pref.end();
   }
+
+  WiFi.disconnect(true);
 
   // Draw calendar
   int firstDayOfWeek = dayOfWeek(year, month, 1);
   int numberOfDays = numberOfDaysInMonth(year, month);
   int numberOfRows = (firstDayOfWeek + numberOfDays - 1) / 7 + 1;
-  int rowHeight = (screenHeight - 30) / numberOfRows;
+  int rowHeight = (EPD_HEIGHT - FOOTER_HEIGHT) / numberOfRows;
 
   blackSprite.fillScreen(WHITE);
   redSprite.fillScreen(WHITE);
@@ -222,14 +256,14 @@ void showCalendar()
   // draw horizontal lines
   for (int i = 1; i <= numberOfRows; i++)
   {
-    blackSprite.drawFastHLine(0, i * rowHeight, screenWidth, BLACK);
+    blackSprite.drawFastHLine(0, i * rowHeight, EPD_WIDTH, BLACK);
   }
 
   // draw vertical lines
   int lineHeight = numberOfRows * rowHeight;
   for (int i = 1; i < 7; i++)
   {
-    blackSprite.drawFastVLine(i * columnWidth, 0, lineHeight, BLACK);
+    blackSprite.drawFastVLine(i * COLUMN_WIDTH, 0, lineHeight, BLACK);
   }
 
   // draw days in month
@@ -239,14 +273,14 @@ void showCalendar()
   {
     int row = (firstDayOfWeek + i - 1) / 7;
     int column = (6 + firstDayOfWeek + i) % 7;
-    boolean holiday = (column == 0 || column == 6 || (holidaysInThisMonth.count(i) > 0)) ? true : false;
+    boolean holiday = (column == 0 || column == 6 || (PCEvent::numberOfHolidaysInDayOfThisMonth(i) > 0)) ? true : false;
     selectedSprite = holiday ? &redSprite : &blackSprite;
 
     // invert color if it is today
     uint16_t dayColor = BLACK;
     if (day == i)
     {
-      selectedSprite->fillRect(column * columnWidth, row * rowHeight, columnWidth, dayHeight, BLACK);
+      selectedSprite->fillRect(column * COLUMN_WIDTH, row * rowHeight, COLUMN_WIDTH, DAY_HEIGHT, BLACK);
       dayColor = WHITE;
     }
 
@@ -255,44 +289,29 @@ void showCalendar()
     selectedSprite->setFont(&fonts::LARGE_FONT);
     int dayWidth = selectedSprite->textWidth(String(i));
     selectedSprite->setTextColor(dayColor);
-    selectedSprite->setCursor(column * columnWidth + (columnWidth - dayWidth) / 2, row * rowHeight + 4);
+    selectedSprite->setCursor(column * COLUMN_WIDTH + (COLUMN_WIDTH - dayWidth) / 2, row * rowHeight + 4);
     selectedSprite->printf("%d", i);
 
     // draw events
     std::vector<PCEvent> eventsInToday;
-    if (holidaysInThisMonth.count(i) > 0)
-    {
-      auto itr = holidaysInThisMonth.lower_bound(i);
-      auto last = holidaysInThisMonth.upper_bound(i);
-      while (itr != last)
-      {
-        eventsInToday.push_back(itr->second);
-        ++itr;
-      }
-    }
-    if (eventsInThisMonth.count(i) > 0)
-    {
-      auto itr = eventsInThisMonth.lower_bound(i);
-      auto last = eventsInThisMonth.upper_bound(i);
-      while (itr != last)
-      {
-        eventsInToday.push_back(itr->second);
-        ++itr;
-      }
-    }
+    auto holidaysInDay = PCEvent::holidaysInDayOfThisMonth(i);
+    eventsInToday.insert(eventsInToday.end(), holidaysInDay.begin(), holidaysInDay.end());
+    auto eventsInDay = PCEvent::eventsInDayOfThisMonth(i);
+    eventsInToday.insert(eventsInToday.end(), eventsInDay.begin(), eventsInDay.end());
+    
     blackSprite.setFont(&fonts::SMALL_FONT);
     redSprite.setFont(&fonts::SMALL_FONT);
     blackSprite.setTextColor(BLACK);
     redSprite.setTextColor(BLACK);
-    blackSprite.setClipRect(column * columnWidth, row * rowHeight + dayHeight, columnWidth, rowHeight - dayHeight);
-    redSprite.setClipRect(column * columnWidth, row * rowHeight + dayHeight, columnWidth, rowHeight - dayHeight);
+    blackSprite.setClipRect(column * COLUMN_WIDTH, row * rowHeight + DAY_HEIGHT, COLUMN_WIDTH, rowHeight - DAY_HEIGHT);
+    redSprite.setClipRect(column * COLUMN_WIDTH, row * rowHeight + DAY_HEIGHT, COLUMN_WIDTH, rowHeight - DAY_HEIGHT);
     if (eventsInToday.size() > 0)
     {
       int i = 0;
       for (auto &event : eventsInToday)
       {
         selectedSprite = event.isHolidayEvent ? &redSprite : &blackSprite;
-        selectedSprite->setCursor(column * columnWidth + 2, row * rowHeight + dayHeight + 13 * i);
+        selectedSprite->setCursor(column * COLUMN_WIDTH + 2, row * rowHeight + DAY_HEIGHT + 13 * i);
         selectedSprite->print("・" + event.getTitle());
         i++;
         if (i >= 3)
@@ -304,11 +323,30 @@ void showCalendar()
 
   }
 
-  // Footer
 
+  // Log date
+  char logBuffer[32];
+  sprintf(logBuffer, "%d/%d/%d %02d:%02d:%02d", year, month, day, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  String logString = String(logBuffer);
+
+  // Log events
+  logString += ", Events:";
+  logString += String(PCEvent::numberOfEventsInThisMonth());
+
+  // Log boot count
+  logString += ", Boot:";
+  logString += String(bootCount);
+
+  // Save boot count
+  pref.begin(prefName, false);
+  pref.putInt(bootCountKey, bootCount);
+  pref.end();
+
+  // Footer
+  // uint32_t voltage = readVoltage();
   blackSprite.setFont(&fonts::SMALL_FONT);
-  blackSprite.setCursor(8, screenHeight - 20);
-  blackSprite.printf("%d/%d/%d %02d:%02d:%02d", year, month, day, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  blackSprite.setCursor(8, EPD_HEIGHT - FOOTER_HEIGHT);
+  blackSprite.print(logString);
 
   Epd epd;
   int initResult = epd.Init();
@@ -318,98 +356,46 @@ void showCalendar()
     Serial.print("e-Paper init failed");
     return;
   }
-  epd.Displaypart((unsigned char *)(blackSprite.getBuffer()), 0, 0, screenWidth, screenHeight, 0);
-  epd.Displaypart((unsigned char *)(redSprite.getBuffer()), 0, 0, screenWidth, screenHeight, 1);
+  epd.Displaypart((unsigned char *)(blackSprite.getBuffer()), 0, 0, EPD_WIDTH, EPD_HEIGHT, 0);
+  epd.Displaypart((unsigned char *)(redSprite.getBuffer()), 0, 0, EPD_WIDTH, EPD_HEIGHT, 1);
   epd.Sleep();
+  
+
+  // Deep sleep
+  loaded = true;
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(1000);
+  shutdown(24 * 3600 - (timeinfo.tm_hour * 3600 + timeinfo.tm_min * 60 + timeinfo.tm_sec) + 300);
 }
 
-void loadICalendar(String urlString, boolean holiday)
+
+uint32_t readVoltage()
 {
-  HTTPClient httpClient;
-  httpClient.begin(urlString, rootCA.c_str());
-  dateString = "";
-  String lastModified = "";
-
-  const char *headerKeys[] = {"Date", "Last-Modified"};
-  httpClient.collectHeaders(headerKeys, 1);
-
-  int result = httpClient.GET();
-  if (result == HTTP_CODE_OK)
+  uint32_t voltage = 0;
+  esp_adc_cal_characteristics_t characteristics;
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_12Bit, 1100, &characteristics);
+  digitalWrite(VOLTAGE_TEST, HIGH);
+  if (esp_adc_cal_get_voltage(ADC_CHANNEL_8, &characteristics, &voltage) == ESP_OK)
   {
-    dateString = httpClient.header("Date");
-    lastModified = httpClient.header("Last-Modified");
-    Serial.println("Last-Modified:" + lastModified);
-    WiFiClient *stream = httpClient.getStreamPtr();
-    if (httpClient.connected())
-    {
-      String previousLine = "";
-      String eventBlock = "";
-      boolean loadingEvent = false;
-      while (stream->available())
-      {
-        String line = stream->readStringUntil('\n');
-        if (line.indexOf(":") < 0) {
-          line = stream->readStringUntil('\n');
-          line = previousLine + line;
-          previousLine = "";
-        } else {
-          previousLine = line;
-        }
 
-        if (line.startsWith("BEGIN:VEVENT"))
-        { // begin VEVENT block
-          loadingEvent = true;
-        }
-        else if (line.startsWith("DTSTART"))
-        { // read start date
-          int position = line.indexOf(":");
-          String timeString = line.substring(position + 1);
-          timeString.trim();
-          tm timeInfo = tmFromICalDateString(timeString, timezone);
-          if (!(timeInfo.tm_year + 1900 == currentYear && timeInfo.tm_mon + 1 == currentMonth) && !(timeInfo.tm_year + 1900 == nextMonthYear && timeInfo.tm_mon + 1 == nextMonth))
-          {
-            // discard event if not scheduled in this month to next month
-            loadingEvent = false;
-            eventBlock = "";
-          }
-        }
-
-        if (loadingEvent)
-        {
-          eventBlock += line + "\n";
-        }
-        if (loadingEvent && line.startsWith("END:VEVENT"))
-        {
-          loadingEvent = false;
-          PCEvent event = PCEvent(eventBlock, timezone);
-          event.isHolidayEvent = holiday;
-          if (event.getMonth() == currentMonth)
-          {
-            // Will be displayed as this month
-            if (holiday)
-            {
-              holidaysInThisMonth.insert(std::make_pair(event.getDay(), event));
-            }
-            else
-            {
-              eventsInThisMonth.insert(std::make_pair(event.getDay(), event));
-            }
-          }
-          else
-          {
-            // Next month
-            eventsInNextMonth.push_back(event);
-          }
-          eventBlock = "";
-        }
-      }
-    }
-    httpClient.end();
+    digitalWrite(VOLTAGE_TEST, LOW);
+    return voltage;
   }
-  else
+  digitalWrite(VOLTAGE_TEST, LOW);
+  return 0;
+}
+
+void logLine(String line) {
+  File logFile = SD_MMC.open("/log.txt", FILE_APPEND, true);
+  if (logFile)
   {
-    // HTTP Error
-    httpClient.end();
-    // shutdownWithMessage("HTTP Error Code:" + result, 60*60*24);
+    logFile.println(line);
   }
+  logFile.close();
+}
+
+void shutdown(int wakeUpSeconds)
+{
+  esp_sleep_enable_timer_wakeup(wakeUpSeconds * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
 }

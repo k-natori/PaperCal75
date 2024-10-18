@@ -1,5 +1,23 @@
+
+#include <HTTPClient.h>
+#include <WiFiClient.h>
+
 #include "PCEvent.h"
 #include "NJScanner.h"
+
+float PCEvent::defaultTimezone = 0.0f;
+int PCEvent::currentYear = 0;
+int PCEvent::currentMonth = 0;
+int PCEvent::currentDay = 0;
+int PCEvent::nextMonthYear = 0;
+int PCEvent::nextMonth = 0;
+
+boolean PCEvent::_isCacheValid = false;
+
+String PCEvent::_rootCA;
+std::multimap<int, PCEvent> PCEvent::_eventsInThisMonth;
+std::multimap<int, PCEvent> PCEvent::_holidaysInThisMonth;
+std::vector<PCEvent> PCEvent::_eventsInNextMonth;
 
 PCEvent::PCEvent(String sourceString, float toTimezone)
 {
@@ -13,67 +31,78 @@ PCEvent::PCEvent(String sourceString, float toTimezone)
 
         if (key == "DTSTART;VALUE=DATE")
         {
-            startTM = tmFromICalDateString(content, 0.0f);
-            isDayEvent = true;
+            _startTM = tmFromICalDateString(content, 0.0f);
+            _isDayEvent = true;
         }
         else if (key == "DTSTART")
         {
-            startTM = tmFromICalDateString(content, toTimezone);
-            isDayEvent = false;
+            _startTM = tmFromICalDateString(content, toTimezone);
+            _isDayEvent = false;
         }
         else if (key.startsWith("DTEND"))
         {
-            endTM = tmFromICalDateString(content, toTimezone);
+            _endTM = tmFromICalDateString(content, toTimezone);
         }
         else if (key == "SUMMARY")
         {
-            title = content;
+            _title = content;
         }
     } while (!scanner.isAtEnd());
+}
+PCEvent::PCEvent(int year, int month, int day, String title)
+{
+    tm timeInfo = {.tm_sec = 0, .tm_min = 0, .tm_hour = 0, .tm_mday = 0, .tm_mon = 0, .tm_year = 0};
+    timeInfo.tm_year = year - 1900;
+    timeInfo.tm_mon = month - 1;
+    timeInfo.tm_mday = day;
+    timeInfo.tm_wday = dayOfWeek(timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday);
+    _startTM = timeInfo;
+    _title = title;
+    _isDayEvent = true;
 }
 
 time_t PCEvent::getTimeT() const
 {
-    tm temp = startTM;
+    tm temp = _startTM;
     return mktime(&temp);
 }
 int PCEvent::getYear()
 {
-    return startTM.tm_year + 1900;
+    return _startTM.tm_year + 1900;
 }
 int PCEvent::getMonth()
 {
-    return startTM.tm_mon + 1;
+    return _startTM.tm_mon + 1;
 }
 int PCEvent::getDay()
 {
-    return startTM.tm_mday;
+    return _startTM.tm_mday;
 }
 int PCEvent::getDayOfWeek()
 {
-    return startTM.tm_wday;
+    return _startTM.tm_wday;
 }
 int PCEvent::getHour()
 {
-    return startTM.tm_hour;
+    return _startTM.tm_hour;
 }
 int PCEvent::getMinute()
 {
-    return startTM.tm_min;
+    return _startTM.tm_min;
 }
 int PCEvent::getSecond()
 {
-    return startTM.tm_sec;
+    return _startTM.tm_sec;
 }
 
 String PCEvent::descriptionForDay(boolean isToday)
 {
     if (isToday)
     {
-        if (startTM.tm_hour > 0)
+        if (_startTM.tm_hour > 0)
         {
             char buf[6];
-            sprintf(buf, "%02d:%02d", startTM.tm_hour, startTM.tm_min);
+            sprintf(buf, "%02d:%02d", _startTM.tm_hour, _startTM.tm_min);
             return String(buf);
         }
         else
@@ -82,19 +111,280 @@ String PCEvent::descriptionForDay(boolean isToday)
         }
     }
     char buf[6];
-    sprintf(buf, "%d/%d", startTM.tm_mon + 1, startTM.tm_mday);
+    sprintf(buf, "%d/%d", _startTM.tm_mon + 1, _startTM.tm_mday);
     return String(buf);
 }
 
 double PCEvent::duration()
 {
-    return difftime(mktime(&endTM), mktime(&startTM));
+    return difftime(mktime(&_endTM), mktime(&_startTM));
 }
 String PCEvent::getTitle()
 {
-    return title;
+    return _title;
 }
 
+// static member functions
+void PCEvent::initialize(String rootCA, tm timeInfo, String holidayCacheString)
+{
+    PCEvent::setRootCA(rootCA);
+    PCEvent::setTimeInfo(timeInfo);
+    PCEvent::setHolidayCacheString(holidayCacheString);
+}
+
+void PCEvent::setRootCA(String newRootCA)
+{
+    PCEvent::_rootCA = newRootCA;
+}
+void PCEvent::setTimeInfo(tm timeInfo)
+{
+    PCEvent::currentYear = timeInfo.tm_year + 1900;
+    PCEvent::currentMonth = timeInfo.tm_mon + 1;
+    PCEvent::currentDay = timeInfo.tm_mday;
+    if (currentMonth == 12)
+    {
+        nextMonthYear = PCEvent::currentYear + 1;
+        nextMonth = 1;
+    }
+    else
+    {
+        nextMonthYear = PCEvent::currentYear;
+        nextMonth = currentMonth + 1;
+    }
+}
+void PCEvent::setHolidayCacheString(String cacheString)
+{
+    _isCacheValid = false;
+    if (cacheString.isEmpty())
+    {
+        return;
+    }
+    char monthString[7];
+    sprintf(monthString, "%04d%02d", PCEvent::currentYear, PCEvent::currentMonth);
+    if (cacheString.startsWith(monthString))
+    { // Holiday cache is valid
+        NJScanner scanner = NJScanner(cacheString);
+        scanner.scanUpToString("\n", true);
+        while (!scanner.isAtEnd())
+        {
+            String dayString = scanner.scanUpToString(":", false);
+            scanner.scanString(":");
+            String title = scanner.scanUpToString("\n", false);
+            if (!dayString.isEmpty())
+            {
+                int day = dayString.toInt();
+                PCEvent event = PCEvent(currentYear, currentMonth, day, title);
+                event.isHolidayEvent = true;
+                PCEvent::_holidaysInThisMonth.insert(std::make_pair(day, event));
+            }
+        }
+        _isCacheValid = true;
+    }
+}
+
+String PCEvent::holidayCacheString()
+{
+    String result = "";
+    char monthString[7];
+    sprintf(monthString, "%04d%02d", PCEvent::currentYear, PCEvent::currentMonth);
+    result += monthString;
+    result += "\n";
+    for (auto it = _holidaysInThisMonth.begin(); it != _holidaysInThisMonth.end(); ++it)
+    {
+        const auto &pair = *it;
+        int day = pair.first;
+        PCEvent event = pair.second;
+        result += day;
+        result += ":";
+        result += event.getTitle();
+        result += "\n";
+    }
+    return result;
+}
+boolean PCEvent::isCacheValid()
+{
+    return _isCacheValid;
+}
+
+boolean PCEvent::loadICalendar(String urlString, boolean holiday)
+{
+    HTTPClient httpClient;
+    httpClient.begin(urlString, PCEvent::_rootCA.c_str());
+    // dateString = "";
+
+    const char *headerKeys[] = {"Transfer-Encoding"};
+    httpClient.collectHeaders(headerKeys, 1);
+
+    int result = httpClient.GET();
+    if (result == HTTP_CODE_OK)
+    {
+
+        boolean chunked = (httpClient.header("Transfer-Encoding") == "chunked");
+        long chunkSize = 0;
+        boolean isChunkSizeLine = false;
+        boolean isTrailingLine = false;
+        String lastLine = "";
+        // dateString = httpClient.header("Date");
+        WiFiClient *stream = httpClient.getStreamPtr();
+        if (httpClient.connected())
+        {
+            String eventBlock = "";
+            boolean loadingEvent = false;
+
+            if (stream->available() && chunked)
+            {
+                chunkSize = intFrom16BaseString(stream->readStringUntil('\n'));
+                // Serial.printf("first chunk: %ld\n", chunkSize);
+            }
+
+            while (stream->available())
+            {
+                String line = stream->readStringUntil('\n');
+                if (chunked)
+                {
+                    if (line.length() == 0 || line == "\r")
+                    {
+                        continue;
+                    }
+                    if (isChunkSizeLine)
+                    {
+                        chunkSize = intFrom16BaseString(line);
+                        // Serial.printf("new chunk: %ld\n", chunkSize);
+                        isChunkSizeLine = false;
+                        isTrailingLine = true;
+                        continue;
+                    }
+                    else if (isTrailingLine)
+                    {
+                        if (lastLine.length() > 1)
+                            lastLine = lastLine.substring(0, lastLine.length() - 1);
+                        chunkSize += lastLine.length();
+
+                        line = lastLine + line;
+                        // Serial.println(line);
+
+                        isTrailingLine = false;
+                    }
+                    chunkSize -= (line.length() + 1);
+                    if (chunkSize <= 0)
+                    {
+                        lastLine = line;
+                        isChunkSizeLine = true;
+                        continue;
+                    }
+                }
+
+                if (line.startsWith("BEGIN:VEVENT"))
+                { // begin VEVENT block
+                    loadingEvent = true;
+                }
+                else if (line.startsWith("DTSTART"))
+                { // read start date
+                    int position = line.indexOf(":");
+                    String timeString = line.substring(position + 1);
+                    timeString.trim();
+                    tm timeInfo = tmFromICalDateString(timeString, PCEvent::defaultTimezone);
+                    if (!(timeInfo.tm_year + 1900 == PCEvent::currentYear && timeInfo.tm_mon + 1 == PCEvent::currentMonth) && !(timeInfo.tm_year + 1900 == nextMonthYear && timeInfo.tm_mon + 1 == nextMonth))
+                    {
+                        // discard event if not scheduled in this month to next month
+                        loadingEvent = false;
+                        eventBlock = "";
+                    }
+                }
+
+                if (loadingEvent)
+                {
+                    eventBlock += line + "\n";
+                }
+                if (loadingEvent && line.startsWith("END:VEVENT"))
+                {
+                    loadingEvent = false;
+                    PCEvent event = PCEvent(eventBlock, PCEvent::defaultTimezone);
+                    event.isHolidayEvent = holiday;
+                    if (event.getMonth() == PCEvent::currentMonth)
+                    {
+                        // Will be displayed as this month
+                        if (holiday)
+                        {
+                            PCEvent::_holidaysInThisMonth.insert(std::make_pair(event.getDay(), event));
+                        }
+                        else
+                        {
+                            PCEvent::_eventsInThisMonth.insert(std::make_pair(event.getDay(), event));
+                        }
+                    }
+                    else
+                    {
+                        // Next month
+                        _eventsInNextMonth.push_back(event);
+                    }
+                    eventBlock = "";
+                }
+            }
+        }
+        httpClient.end();
+        return true;
+    }
+    else
+    {
+        // HTTP Error
+        httpClient.end();
+    }
+    return false;
+}
+
+int PCEvent::numberOfEventsInThisMonth()
+{
+    return PCEvent::_eventsInThisMonth.size();
+}
+
+int PCEvent::numberOfEventsInDayOfThisMonth(int day)
+{
+    return PCEvent::_eventsInThisMonth.count(day);
+}
+
+std::vector<PCEvent> PCEvent::eventsInDayOfThisMonth(int day)
+{
+    std::vector<PCEvent> eventsInDay;
+    if (PCEvent::_eventsInThisMonth.count(day) > 0)
+    {
+        auto itr = PCEvent::_eventsInThisMonth.lower_bound(day);
+        auto last = PCEvent::_eventsInThisMonth.upper_bound(day);
+        while (itr != last)
+        {
+            eventsInDay.push_back(itr->second);
+            ++itr;
+        }
+    }
+    return eventsInDay;
+}
+
+int PCEvent::numberOfHolidaysInDayOfThisMonth(int day)
+{
+    return PCEvent::_holidaysInThisMonth.count(day);
+}
+
+std::vector<PCEvent> PCEvent::holidaysInDayOfThisMonth(int day)
+{
+    std::vector<PCEvent> eventsInDay;
+    if (PCEvent::_holidaysInThisMonth.count(day) > 0)
+    {
+        auto itr = PCEvent::_holidaysInThisMonth.lower_bound(day);
+        auto last = PCEvent::_holidaysInThisMonth.upper_bound(day);
+        while (itr != last)
+        {
+            eventsInDay.push_back(itr->second);
+            ++itr;
+        }
+    }
+    return eventsInDay;
+}
+std::vector<PCEvent> PCEvent::eventsInNextMonth()
+{
+    return PCEvent::_eventsInNextMonth;
+}
+
+// Other functions
 bool operator<(const PCEvent &left, const PCEvent &right)
 {
     return (left.getTimeT() < right.getTimeT());

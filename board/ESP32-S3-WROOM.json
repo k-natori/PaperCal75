@@ -35,7 +35,7 @@
     "arduino",
     "espidf"
   ],
-  "name": "ESP32-S3 WROOM Freenove",
+  "name": "ESP32-S3-WROOM-Freenove",
   "upload": {
     "flash_size": "8MB",
     "maximum_ram_size": 327680,
